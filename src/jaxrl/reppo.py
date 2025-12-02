@@ -6,6 +6,7 @@ from typing import Callable
 import hydra
 import jax
 import numpy as np
+import distrax
 import optax
 import optuna
 import plotly.graph_objs as go
@@ -103,6 +104,12 @@ class ReppoConfig(struct.PyTreeNode):
     reverse_kl: bool = False
     anneal_lr: bool = False
     actor_kl_clip_mode: str = "clipped"
+
+    lang: bool = False
+    lang_a: float = 1.
+    lang_b: float = 100.
+    lang_its: int = 20
+    lang_prior_scaler: float = 0.001
 
 
 class SACTrainState(struct.PyTreeNode):
@@ -344,10 +351,40 @@ def make_train_fn(
             key, act_key, step_key = jax.random.split(key, 3)
             step_key = jax.random.split(step_key, cfg.num_envs)
 
+            def get_langevin_action(obs, critic_obs, key):
+                act_key, key = jax.random.split(key)
+
+                pi: distrax.Distribution = actor_model.actor(obs, scale=offset)
+                policy_action = pi.sample(seed=act_key)
+
+                grad_log_pi = jax.grad(lambda act: pi.log_prob(act).sum())
+                grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1), in_axes=(0,0))
+
+                action = policy_action
+                alpha = actor_model.temperature()
+
+                for it in range(cfg.lang_its):
+                    eta_key, key = jax.random.split(key)
+
+                    eps = cfg.lang_a / (cfg.lang_b + it)
+                    eta = jax.random.normal(eta_key, policy_action.shape)
+
+                    act_delta = eps * 0.5 * (grad_q(critic_obs, action) \
+                          + alpha * cfg.lang_prior_scaler * grad_log_pi(action)) \
+                          + alpha * jnp.sqrt(eps) * eta
+                    
+                    action = action + act_delta
+
+                return action
+
             # get policy action
             og_pi = actor_model.actor(obs)
             pi = actor_model.actor(obs, scale=offset)
-            action = pi.sample(seed=act_key)
+
+            if cfg.lang:
+                action = get_langevin_action(obs, critic_obs, act_key)
+            else:
+                action = pi.sample(seed=act_key)
 
             next_obs, next_critic_obs, next_env_state, reward, done, info = env.step(
                 step_key, env_state, action

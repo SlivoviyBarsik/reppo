@@ -69,6 +69,11 @@ hyperparameters:
   ## auxiliary loss settings
   aux_loss_mult: 1.0
 
+  lang: False
+  lang_a: 1.
+  lang_b: 100.
+  lang_its: 20
+
 measure_burnin: 3
 
 name: "reppo"
@@ -80,7 +85,7 @@ num_trials: 10
 tags: ["experimental"]
 wandb:
   mode: "online" # set to online to activate wandb
-  entity: "viper_svg"
+  entity: "slivoviy-barsik_team"
   project: "reppo"
 
 hydra:
