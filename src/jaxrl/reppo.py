@@ -375,16 +375,33 @@ def make_train_fn(
                     
                     action = action + act_delta
 
-                return action
+                return action, dict(
+                    lang_total_act_delta_norm = jnp.linalg.norm(action - policy_action, axis=-1), 
+                    lang_last_act_delta_norm = jnp.linalg.norm(act_delta, axis=-1),
+                    lang_first_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, policy_action), axis=-1),
+                    lang_first_grad_pi_norm = jnp.linalg.norm(grad_log_pi(policy_action), axis=-1),
+
+                    lang_last_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, action), axis=-1),
+                    lang_last_grad_pi_norm = jnp.linalg.norm(grad_log_pi(action), axis=-1),
+
+                    lang_value_delta = critic_model.critic(critic_obs, action) - critic_model.critic(critic_obs, policy_action),
+                    lang_alpha = alpha,
+
+                    policy_act_norm = jnp.linalg.norm(policy_action, axis=-1),
+                    lang_act_norm = jnp.linalg.norm(action, axis=-1),
+                )
 
             # get policy action
             og_pi = actor_model.actor(obs)
             pi = actor_model.actor(obs, scale=offset)
 
             if cfg.lang:
-                action = get_langevin_action(obs, critic_obs, act_key)
+                action, act_info = get_langevin_action(obs, critic_obs, act_key)
             else:
                 action = pi.sample(seed=act_key)
+                act_info = dict(
+                    policy_act_norm = jnp.linalg.norm(action)
+                )
 
             next_obs, next_critic_obs, next_env_state, reward, done, info = env.step(
                 step_key, env_state, action
@@ -428,9 +445,9 @@ def make_train_fn(
                 train_state,
                 next_obs,
                 next_critic_obs,
-            ), transition
+            ), (transition, act_info)
 
-        rollout_state, transitions = jax.lax.scan(
+        rollout_state, (transitions, act_info) = jax.lax.scan(
             f=step_env,
             init=(
                 key,
@@ -449,7 +466,7 @@ def make_train_fn(
             time_steps=train_state.time_steps + cfg.num_steps * cfg.num_envs,
         )
 
-        return transitions, train_state
+        return transitions, train_state, act_info
 
     def learn_step(
         key: PRNGKey, train_state: SACTrainState, batch: Transition
@@ -715,24 +732,26 @@ def make_train_fn(
                 state: SACTrainState, key: PRNGKey
             ) -> tuple[SACTrainState, dict[str, jax.Array]]:
                 key, rollout_key, learn_key = jax.random.split(key, 3)
-                transitions, state = collect_rollout(key=rollout_key, train_state=state)
+                transitions, state, act_info = collect_rollout(key=rollout_key, train_state=state)
                 state, update_metrics = learn_step(
                     key=learn_key, train_state=state, batch=transitions
                 )
                 metrics = {**update_metrics, **update_metrics}
                 state = state.replace(iteration=state.iteration + 1)
-                return state, metrics
+                return state, (metrics, act_info)
 
             train_key, eval_key = jax.random.split(key)
             eval_interval = int(
                 (cfg.total_time_steps / (cfg.num_steps * cfg.num_envs)) // cfg.num_eval
             )
-            train_state, train_metrics = jax.lax.scan(
+            train_state, (train_metrics, act_infos) = jax.lax.scan(
                 f=train_step,
                 init=train_state,
                 xs=jax.random.split(train_key, eval_interval),
             )
             train_metrics = jax.tree.map(lambda x: x[-1], train_metrics)
+            act_infos = jax.tree.map(lambda x: x[-1], act_infos)
+
             policy = make_policy(train_state)
             if cfg.normalize_env:
                 norm_state = train_state.last_env_state
@@ -747,6 +766,11 @@ def make_train_fn(
                     "returned_episode_lengths"
                 ].mean(),
             }
+
+            train_returns.update({
+                f"train/{key}": val.mean() for key, val in act_infos.items()
+            })
+
             metrics = {
                 "time_step": train_state.time_steps,
                 **utils.prefix_dict("train", train_metrics),
