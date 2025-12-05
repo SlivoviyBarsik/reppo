@@ -355,7 +355,7 @@ def make_train_fn(
                 act_key, key = jax.random.split(key)
 
                 pi: distrax.Distribution = actor_model.actor(obs, scale=offset)
-                policy_action = pi.sample(seed=act_key)
+                policy_action: jax.Array = actor_model.det_action(obs)
 
                 grad_log_pi = jax.grad(lambda act: pi.log_prob(act).sum())
                 grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1), in_axes=(0,0))
@@ -374,6 +374,7 @@ def make_train_fn(
                           + alpha * jnp.sqrt(eps) * eta
                     
                     action = action + act_delta
+                    action = jnp.clip(action, -1. + 1.e-7, 1. - 1.e-7)
 
                 return action, dict(
                     lang_total_act_delta_norm = jnp.linalg.norm(action - policy_action, axis=-1), 
@@ -906,7 +907,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         episode_return = metrics["eval/episode_return"].mean()
         eval_length = metrics["eval/episode_length"].mean()
         logging.info(
-            f"step={state.time_steps[0]} episode_return={episode_return:.3f}, episode_length={eval_length:.3f} sps={sps:.2f}"
+            f"step={state.time_steps[0]} episode_return={episode_return:.3f}, episode_length={eval_length:.3f} sps={sps:.2f}, \n {metrics}"
         )
         log_data = {
             "eval/episode_return": episode_return,
