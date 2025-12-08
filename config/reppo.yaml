@@ -71,8 +71,9 @@ hyperparameters:
 
   lang: False
   lang_a: 1.
-  lang_b: 100.
-  lang_its: 20
+  lang_b: 50.
+  lang_its: 5
+  lang_prior_scaler: 0.001
 
 measure_burnin: 3
 
