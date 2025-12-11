@@ -357,7 +357,14 @@ def make_train_fn(
                 pi: distrax.Distribution = actor_model.actor(obs, scale=offset)
                 policy_action: jax.Array = actor_model.det_action(obs)
 
-                grad_log_pi = jax.grad(lambda act: pi.log_prob(act).sum())
+                def grad_log_pi(action):
+                    log_prob = lambda a: pi.log_prob(a).sum(-1)
+                    grad = jax.jacrev(log_prob)(action)
+                    grad = jnp.diagonal(grad, axis1=0, axis2=1)
+                    grad = jnp.transpose(grad, (1,0))
+
+                    return grad 
+                
                 grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1), in_axes=(0,0))
 
                 action = policy_action
