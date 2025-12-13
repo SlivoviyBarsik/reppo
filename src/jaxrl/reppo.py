@@ -352,24 +352,21 @@ def make_train_fn(
             step_key = jax.random.split(step_key, cfg.num_envs)
 
             def get_langevin_action(obs, critic_obs, key):
+                act_key, key = jax.random.split(key)
+
                 pi: distrax.Distribution = actor_model.actor(obs, scale=offset)
-                policy_action: jax.Array = actor_model.det_action(obs)
+                policy_action: jax.Array = pi.sample(seed=act_key)
 
                 def grad_log_pi(action):
-                    log_prob = lambda a: pi.log_prob(a).sum(-1)
-                    grad = jax.jacrev(log_prob)(action)
+                    pi = distrax.Independent(pi, reinterpreted_batch_ndims=1)
+                    grad = jax.jacrev(pi.log_prob)(action)
                     grad = jnp.diagonal(grad, axis1=0, axis2=1)
                     grad = jnp.transpose(grad, (1,0))
 
                     return grad 
                 
-                def grad_q(action):
-                    q_grad = jax.jacrev(critic_model.critic, argnums=1)(critic_obs, action)
-                    q_grad = jnp.diagonal(q_grad, axis1=0, axis2=1)
-                    q_grad = jnp.transpose(q_grad, (1,0))
-
-                    return q_grad
-
+                grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1))
+                    
                 action = policy_action
                 alpha = actor_model.temperature()
 
@@ -379,20 +376,20 @@ def make_train_fn(
                     eps = cfg.lang_a / (cfg.lang_b + it)
                     eta = jax.random.normal(eta_key, policy_action.shape)
 
-                    act_delta = eps * 0.5 * (grad_q(action) \
+                    act_delta = eps * 0.5 * (grad_q(critic_obs, action) \
                           + alpha * cfg.lang_prior_scaler * grad_log_pi(action)) \
                           + alpha * jnp.sqrt(eps) * eta
                     
                     action = action + act_delta
-                    action = jnp.clip(action, -1. + 1.e-7, 1. - 1.e-7)
+                    action = jnp.clip(action, -1. + 1.e-4, 1. - 1.e-4)
 
                 return action, dict(
                     lang_total_act_delta_norm = jnp.linalg.norm(action - policy_action, axis=-1), 
                     lang_last_act_delta_norm = jnp.linalg.norm(act_delta, axis=-1),
-                    lang_first_grad_q_norm = jnp.linalg.norm(grad_q(policy_action), axis=-1),
+                    lang_first_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, policy_action), axis=-1),
                     lang_first_grad_pi_norm = jnp.linalg.norm(grad_log_pi(policy_action), axis=-1),
 
-                    lang_last_grad_q_norm = jnp.linalg.norm(grad_q(action), axis=-1),
+                    lang_last_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, action), axis=-1),
                     lang_last_grad_pi_norm = jnp.linalg.norm(grad_log_pi(action), axis=-1),
 
                     lang_value_delta = critic_model.critic(critic_obs, action) - critic_model.critic(critic_obs, policy_action),
