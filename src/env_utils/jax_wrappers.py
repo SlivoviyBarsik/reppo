@@ -125,12 +125,12 @@ def make_randomization_fn(cfg, mj_model):
         return None 
     
     gravity_perturbations = distrax.MultivariateNormalDiag(
-        loc = jnp.log(jnp.e - 1), 
+        loc = jnp.log(jnp.e - 1) * jnp.ones_like(mj_model.opt.gravity), 
         scale_diag = (mj_model.opt.gravity != 0) * cfg["gravity_pert"]
     )
 
     body_mass_perturbations = distrax.Normal(
-        loc = jnp.log(jnp.e - 1), 
+        loc = jnp.log(jnp.e - 1) * jnp.ones_like(mj_model.body_mass),
         scale = cfg["body_mass_pert"] * jnp.ones_like(mj_model.body_mass)
     ) 
     
@@ -146,12 +146,12 @@ def make_randomization_fn(cfg, mj_model):
 
         out_mjx_model = mjx_model.replace(
             opt = mjx_model.opt.replace(
-                gravity = gravity * out_mjx_model.opt.gravity
+                gravity = gravity * mjx_model.opt.gravity
             )
         )
 
         out_mjx_model = out_mjx_model.replace(
-            body_mass = body_mass * out_mjx_model.body_mass
+            body_mass = body_mass * mjx_model.body_mass
         )
         
         in_axes_mjx_model = jax.tree_util.tree_map(lambda _: None, out_mjx_model)
