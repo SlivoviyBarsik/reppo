@@ -9,5 +9,5 @@ vmin: 0
 vmax: 150
 
 pert:
-  torso_mass_pert: 0.01
+  body_mass_pert: 1.
   gravity_pert: 0.

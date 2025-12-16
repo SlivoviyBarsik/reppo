@@ -125,32 +125,33 @@ def make_randomization_fn(cfg, mj_model):
         return None 
     
     gravity_perturbations = distrax.MultivariateNormalDiag(
-        loc = mj_model.opt.gravity, 
+        loc = jnp.log(jnp.e - 1), 
         scale_diag = (mj_model.opt.gravity != 0) * cfg["gravity_pert"]
     )
 
-    torso_mass_perturbations = distrax.Normal(
-        loc = 1., 
-        scale = cfg["torso_mass_pert"] * jnp.zeros_like(mj_model.body_mass).at[mj_model.body("torso").id].set(1.)) 
+    body_mass_perturbations = distrax.Normal(
+        loc = jnp.log(jnp.e - 1), 
+        scale = cfg["body_mass_pert"] * jnp.ones_like(mj_model.body_mass)
+    ) 
     
     def randomization_fn(mjx_model, rng):
         def make_random_vecs(rng):
             mass_rng, gravity_rng = jax.random.split(rng)
-            _torso_mass = torso_mass_perturbations.sample(seed=mass_rng)
-            _gravity = gravity_perturbations.sample(seed=gravity_rng)
+            body_mass = jnp.log(body_mass_perturbations.sample(seed=mass_rng) + 1)
+            gravity = jnp.log(gravity_perturbations.sample(seed=gravity_rng) + 1)
 
-            return _torso_mass, _gravity
+            return body_mass, gravity
         
-        torso_mass, gravity = jax.vmap(make_random_vecs)(rng)
+        body_mass, gravity = jax.vmap(make_random_vecs)(rng)
 
         out_mjx_model = mjx_model.replace(
             opt = mjx_model.opt.replace(
-                gravity = gravity
+                gravity = gravity * out_mjx_model.opt.gravity
             )
         )
 
         out_mjx_model = out_mjx_model.replace(
-            body_mass = torso_mass * out_mjx_model.body_mass
+            body_mass = body_mass * out_mjx_model.body_mass
         )
         
         in_axes_mjx_model = jax.tree_util.tree_map(lambda _: None, out_mjx_model)
