@@ -2,6 +2,7 @@ from functools import partial
 from typing import Any, Tuple, Union
 
 import chex
+import distrax
 import gymnax
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,7 @@ from gymnax.environments import environment, spaces
 from gymnax.environments.environment import Environment
 from gymnax.environments.spaces import Box
 from ml_collections import ConfigDict
+from mujoco import mjx
 from mujoco_playground import MjxEnv, registry
 from mujoco_playground._src.wrapper import wrap_for_brax_training, Wrapper
 
@@ -26,6 +28,7 @@ class MjxGymnaxWrapper(Environment):
         push_distractions: bool = False,
         config: dict = None,
         asymmetric_observation: bool = False,
+        randomization_cfg: dict = None,
     ):
         if isinstance(env_or_name, str):
             if config is None:
@@ -43,7 +46,8 @@ class MjxGymnaxWrapper(Environment):
             env = registry.load(env_or_name, config=config)
             if episode_length is not None:
                 env = wrap_for_brax_training(
-                    env, episode_length=episode_length, action_repeat=action_repeat
+                    env, episode_length=episode_length, action_repeat=action_repeat,
+                    randomization_fn=make_randomization_fn(randomization_cfg, env.mj_model)
                 )
             self.env = env
         else:
@@ -94,26 +98,71 @@ class MjxGymnaxWrapper(Environment):
         return gymnax.EnvParams()
 
     def reset(self, key):
-        state = self.env.reset(key)
+        state, mjx_model = self.env.reset(key)
         # state.info["truncation"] = 0.0
         obs = state.obs if not self.dict_obs else state.obs["state"]
         critic_obs = state.obs if not self.dict_obs else state.obs[self.dict_obs_key]
-        return obs, critic_obs, state
+        return obs, critic_obs, state, mjx_model
 
-    def step(self, key, state, action):
+    def step(self, key, state, model, action):
         # action = jnp.nan_to_num(action, 0.0)
-        state = self.env.step(state, action)
+        state, model = self.env.step(state, model, action)
         obs = state.obs if not self.dict_obs else state.obs["state"]
         critic_obs = state.obs if not self.dict_obs else state.obs[self.dict_obs_key]
         return (
             obs,
             critic_obs,
             state,
+            model,
             state.reward * self.reward_scale,
             state.done > 0.5,
             {},
         )
+    
 
+def make_randomization_fn(cfg, mj_model):
+    if cfg is None:
+        return None 
+    
+    gravity_perturbations = distrax.MultivariateNormalDiag(
+        loc = mj_model.opt.gravity, 
+        scale_diag = (mj_model.opt.gravity != 0) * cfg["gravity_pert"]
+    )
+
+    torso_mass_perturbations = distrax.Normal(
+        loc = 1., 
+        scale = cfg["torso_mass_pert"] * jnp.zeros_like(mj_model.body_mass).at[mj_model.body("torso").id].set(1.)) 
+    
+    def randomization_fn(mjx_model, rng):
+        def make_random_vecs(rng):
+            mass_rng, gravity_rng = jax.random.split(rng)
+            _torso_mass = torso_mass_perturbations.sample(seed=mass_rng)
+            _gravity = gravity_perturbations.sample(seed=gravity_rng)
+
+            return _torso_mass, _gravity
+        
+        torso_mass, gravity = jax.vmap(make_random_vecs)(rng)
+
+        out_mjx_model = mjx_model.replace(
+            opt = mjx_model.opt.replace(
+                gravity = gravity
+            )
+        )
+
+        out_mjx_model = out_mjx_model.replace(
+            body_mass = torso_mass * out_mjx_model.body_mass
+        )
+        
+        in_axes_mjx_model = jax.tree_util.tree_map(lambda _: None, out_mjx_model)
+        in_axes_mjx_model = in_axes_mjx_model.replace(
+            body_mass = 0,
+            opt = in_axes_mjx_model.opt.replace(gravity=0)
+        )
+    
+
+        return out_mjx_model, in_axes_mjx_model 
+
+    return randomization_fn
 
 @struct.dataclass
 class LogEnvState:
@@ -142,7 +191,7 @@ class LogWrapper(Wrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key) -> Tuple[chex.Array, environment.EnvState]:
-        obs, critic_obs, env_state = self.env.reset(key)
+        obs, critic_obs, env_state, env_model = self.env.reset(key)
         state = LogEnvState(
             env_state=env_state,
             episode_returns=jnp.zeros((self.num_envs,)),
@@ -160,17 +209,18 @@ class LogWrapper(Wrapper):
                 ),
             },
         )
-        return obs, critic_obs, state
+        return obs, critic_obs, state, env_model
 
     @partial(jax.jit, static_argnums=(0,))
     def step(
         self,
         key: chex.PRNGKey,
         state: environment.EnvState,
+        model: mjx.Model,
         action: Union[int, float],
     ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
-        obs, critic_obs, env_state, reward, done, info = self.env.step(
-            key, state.env_state, action
+        obs, critic_obs, env_state, model, reward, done, info = self.env.step(
+            key, state.env_state, model, action
         )
         new_episode_return = state.episode_returns + reward
         new_episode_length = state.episode_lengths + 1
@@ -194,7 +244,7 @@ class LogWrapper(Wrapper):
             truncated=env_state.info["truncation"],
             info=info,
         )
-        return obs, critic_obs, state, reward, done, info
+        return obs, critic_obs, state, model, reward, done, info
 
 
 class BraxGymnaxWrapper:
@@ -232,7 +282,7 @@ class BraxGymnaxWrapper:
             {},
         )
 
-    def observation_space(self):
+    def observation_space(self, params):
         return spaces.Box(
             low=-jnp.inf,
             high=jnp.inf,
@@ -243,7 +293,7 @@ class BraxGymnaxWrapper:
             shape=(self.env.observation_size,),
         )
 
-    def action_space(self):
+    def action_space(self, params):
         return spaces.Box(
             low=-1.0,
             high=1.0,
@@ -257,11 +307,11 @@ class ClipAction(Wrapper):
         self.low = low
         self.high = high
 
-    def step(self, key, state, action):
+    def step(self, key, state, model, action):
         """TODO: In theory the below line should be the way to do this."""
         # action = jnp.clip(action, self.env.action_space.low, self.env.action_space.high)
         action = jnp.clip(action, self.low, self.high)
-        return self.env.step(key, state, action)
+        return self.env.step(key, state, model, action)
 
 
 @struct.dataclass
@@ -314,7 +364,7 @@ class NormalizeVec(Wrapper):
         return new_mean, new_var
 
     def reset(self, key, params=None):
-        obs, critic_obs, env_state = self.env.reset(key)
+        obs, critic_obs, env_state, env_model = self.env.reset(key)
         if params is not None:
             mean = params.mean
             var = params.var
@@ -341,11 +391,12 @@ class NormalizeVec(Wrapper):
             (obs - state.mean) / jnp.sqrt(state.var + 1e-2),
             (critic_obs - state.critic_mean) / jnp.sqrt(state.critic_var + 1e-2),
             state,
+            env_model,
         )
 
-    def step(self, key, state, action):
-        obs, critic_obs, env_state, reward, done, info = self.env.step(
-            key, state.env_state, action
+    def step(self, key, state, model, action):
+        obs, critic_obs, env_state, model, reward, done, info = self.env.step(
+            key, state.env_state, model, action
         )
 
         new_mean, new_var = self._compute_stats(state.mean, state.var, state.count, obs)
@@ -369,6 +420,7 @@ class NormalizeVec(Wrapper):
             (obs - state.mean) / jnp.sqrt(state.var + 1e-2),
             (critic_obs - state.critic_mean) / jnp.sqrt(state.critic_var + 1e-2),
             state,
+            model,
             reward,
             done,
             info,
