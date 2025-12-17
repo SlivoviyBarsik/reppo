@@ -12,6 +12,7 @@ import plotly.graph_objs as go
 from flax import nnx, struct
 from flax.struct import PyTreeNode
 from gymnax.environments.environment import Environment, EnvParams, EnvState
+from mujoco import mjx
 from jax import numpy as jnp
 from jax.experimental import checkify
 from jax.random import PRNGKey
@@ -77,6 +78,7 @@ class PPOTrainState(nnx.TrainState):
     iteration: int
     time_steps: int
     last_env_state: EnvState
+    last_env_model: mjx.Model
     last_obs: jax.Array
     last_critic_obs: jax.Array
     normalization_state: NormalizationState | None = None
@@ -152,21 +154,21 @@ def make_eval_fn(
 ) -> Callable[[jax.random.PRNGKey, Policy], dict[str, float]]:
     def evaluation_fn(key: jax.random.PRNGKey, policy: Policy):
         def step_env(carry, _):
-            key, env_state, obs = carry
+            key, env_state, env_model, obs = carry
             key, act_key, env_key = jax.random.split(key, 3)
             action, _ = policy(act_key, obs)
             env_key = jax.random.split(env_key, env.num_envs)
-            obs, _, env_state, reward, done, info = env.step(
-                env_key, env_state, action.clip(-1.0 + 1e-4, 1.0 - 1e-4)
+            obs, _, env_state, env_model, reward, done, info = env.step(
+                env_key, env_state, env_model, action.clip(-1.0 + 1e-4, 1.0 - 1e-4)
             )
-            return (key, env_state, obs), info
+            return (key, env_state, env_model, obs), info
 
         key, init_key = jax.random.split(key)
         init_key = jax.random.split(init_key, env.num_envs)
-        obs, _, env_state = env.reset(init_key)
+        obs, _, env_state, env_model = env.reset(init_key)
         _, infos = jax.lax.scan(
             f=step_env,
-            init=(key, env_state, obs),
+            init=(key, env_state, env_model, obs),
             xs=None,
             length=max_episode_steps,
         )
@@ -234,7 +236,7 @@ def make_init(
         # Reset and fully initialize the environment
         key, env_key = jax.random.split(key)
         env_key = jax.random.split(env_key, cfg.num_envs)
-        obs, critic_obs, env_state = env.reset(env_key)
+        obs, critic_obs, env_state, env_model = env.reset(env_key)
         # randomize initial time step to prevent all envs stepping in tandem
         _env_state = env_state.unwrapped()
         key, randomize_steps_key = jax.random.split(key)
@@ -265,6 +267,7 @@ def make_init(
             params=nnx.state(networks),
             tx=optimizer,
             last_env_state=env_state,
+            last_env_model=env_model,
             last_obs=obs,
             last_critic_obs=critic_obs,
             normalization_state=norm_state,
@@ -298,7 +301,7 @@ def make_train_fn(
 
         # Take a step in the environment
         def step_env(carry, _) -> tuple[tuple, Transition]:
-            key, env_state, train_state, obs, critic_obs = carry
+            key, env_state, env_model, train_state, obs, critic_obs = carry
 
             if cfg.normalize_env:
                 norm_state = normalizer.update(train_state.normalization_state, obs)
@@ -313,8 +316,8 @@ def make_train_fn(
             action = pi.sample(seed=act_key)
             # Take a step in the environment
             step_key = jax.random.split(step_key, cfg.num_envs)
-            next_obs, next_critic_obs, next_env_state, reward, done, info = env.step(
-                step_key, env_state, action.clip(-1.0 + 1e-4, 1.0 - 1e-4)
+            next_obs, next_critic_obs, next_env_state, next_env_model, reward, done, info = env.step(
+                step_key, env_state, env_model, action.clip(-1.0 + 1e-4, 1.0 - 1e-4)
             )
             # Record the transition
             transition = Transition(
@@ -331,6 +334,7 @@ def make_train_fn(
             return (
                 key,
                 next_env_state,
+                next_env_model,
                 train_state,
                 next_obs,
                 next_critic_obs,
@@ -342,6 +346,7 @@ def make_train_fn(
             init=(
                 key,
                 train_state.last_env_state,
+                train_state.last_env_model,
                 train_state,
                 train_state.last_obs,
                 train_state.last_critic_obs,
@@ -349,9 +354,10 @@ def make_train_fn(
             length=cfg.num_steps,
         )
         # Aggregate the transitions across all the environments to reset for the next iteration
-        _, last_env_state, train_state, last_obs, last_critic_obs = rollout_state
+        _, last_env_state, last_env_model, train_state, last_obs, last_critic_obs = rollout_state
         train_state = train_state.replace(
             last_env_state=last_env_state,
+            last_env_model=last_env_model,
             last_obs=last_obs,
             last_critic_obs=last_critic_obs,
             time_steps=train_state.time_steps + cfg.num_steps * cfg.num_envs,
@@ -653,7 +659,8 @@ def run(cfg: DictConfig):
             cfg.env.name
         )  # , episode_length=cfg.env.max_episode_steps
     elif cfg.env.type == "mjx":
-        env = MjxGymnaxWrapper(cfg.env.name, episode_length=cfg.env.max_episode_steps)
+        env = MjxGymnaxWrapper(cfg.env.name, episode_length=cfg.env.max_episode_steps,
+                               randomization_cfg=cfg.env.get("pert", None))
     else:
         raise ValueError(f"Unknown environment type: {cfg.env.type}")
 
