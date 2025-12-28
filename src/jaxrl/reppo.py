@@ -111,6 +111,7 @@ class ReppoConfig(struct.PyTreeNode):
     lang_b: float = 100.
     lang_its: int = 20
     lang_prior_scaler: float = 0.001
+    lang_precond: bool = False
 
 
 class SACTrainState(struct.PyTreeNode):
@@ -127,13 +128,93 @@ class SACTrainState(struct.PyTreeNode):
 
 def make_policy(
     train_state: SACTrainState,
-) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, dict]]:
-    def policy(key: PRNGKey, obs: jax.Array) -> tuple[jax.Array, dict]:
+    config: ReppoConfig,
+) -> Callable[[jax.Array, jax.Array, jax.Array], tuple[jax.Array, dict]]:
+    def policy(key: PRNGKey, obs: jax.Array, critic_obs: jax.Array) -> tuple[jax.Array, dict]:
         actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
         action: jax.Array = actor_model.det_action(obs)
         return action, {}
+    
+    def langevin_policy(key: PRNGKey, obs: jax.Array, critic_obs: jax.Array) -> tuple[jax.Array, dict]:
+        act_key, key = jax.random.split(key)
+
+        actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
+        critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+
+        pi: distrax.Distribution = actor_model.actor(obs)
+        pi = distrax.Independent(pi, reinterpreted_batch_ndims=1)
+        policy_action: jax.Array = pi.sample(seed=act_key)
+
+        def grad_log_pi(action):
+            grad = jax.jacrev(pi.log_prob)(action)
+            grad = jnp.diagonal(grad, axis1=0, axis2=1)
+            grad = jnp.transpose(grad, (1,0))
+
+            return grad 
+        
+        def hessian_precond(action):
+            hess = jax.hessian(pi.log_prob)(action)
+            hess = jnp.diagonal(hess, axis1=1, axis2=3)
+            hess = jnp.diagonal(hess, axis1=0, axis2=3)
+            hess = jnp.diagonal(hess, axis1=0, axis2=1)  # because hess is diagonal
+
+            return 1. / (jnp.abs(hess) + 1e-7) 
+        
+        grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1))
+            
+        action = policy_action
+        alpha = actor_model.temperature()
+
+        for it in range(config.lang_its):
+            eta_key, key = jax.random.split(key)
+
+            eps = config.lang_a / (config.lang_b + it)
+            eta = jax.random.normal(eta_key, policy_action.shape)
+
+            if config.lang_precond:
+                C = hessian_precond(action)
+            else:
+                C = jnp.ones_like(action)
+
+            act_delta = eps * 0.5 * C * (grad_q(critic_obs, action) \
+                    + alpha * config.lang_prior_scaler * grad_log_pi(action)) \
+                    + alpha * jnp.sqrt(eps * C) * eta
+            
+            action = action + act_delta
+            action = jnp.clip(action, -1. + 1.e-4, 1. - 1.e-4)
+
+    
+        first_q_grad = grad_q(critic_obs, policy_action)
+        first_pi_grad = grad_log_pi(policy_action)
+
+        return action, dict(
+            lang_total_act_delta_norm = jnp.linalg.norm(action - policy_action, axis=-1), 
+            lang_last_act_delta_norm = jnp.linalg.norm(act_delta, axis=-1),
+
+            lang_first_grad_q_norm = jnp.linalg.norm(first_q_grad, axis=-1),
+            lang_first_grad_q_max = first_q_grad.max( axis=-1),
+            lang_first_grad_pi_norm = jnp.linalg.norm(first_pi_grad, axis=-1),
+            lang_first_grad_pi_max = first_pi_grad.max(axis=-1),
+
+            lang_last_precond_norm = jnp.linalg.norm(C, axis=-1),
+            lang_last_precond_max = C.max(axis=-1),
+            lang_last_precond_min = C.min(axis=-1),
+
+            lang_last_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, action), axis=-1),
+            lang_last_grad_pi_norm = jnp.linalg.norm(grad_log_pi(action), axis=-1),
+
+            lang_value_delta = critic_model.critic(critic_obs, action) - critic_model.critic(critic_obs, policy_action),
+            lang_alpha = alpha,
+
+            policy_act_norm = jnp.linalg.norm(policy_action, axis=-1),
+            lang_act_norm = jnp.linalg.norm(action, axis=-1),
+        )
+    
+    if config.lang:
+        return langevin_policy
 
     return policy
+
 
 
 def make_eval_fn(
@@ -143,23 +224,23 @@ def make_eval_fn(
         key: jax.random.PRNGKey, policy: Policy, norm_state: PyTreeNode | None
     ):
         def step_env(carry, _):
-            key, env_state, env_model, obs = carry
+            key, env_state, env_model, obs, critic_obs = carry
             key, act_key, env_key = jax.random.split(key, 3)
-            action, _ = policy(act_key, obs)
+            action, _ = policy(act_key, obs, critic_obs)
             step_key = jax.random.split(env_key, env.num_envs)
-            obs, _, env_state, env_model, reward, done, info = env.step(
+            obs, critic_obs, env_state, env_model, reward, done, info = env.step(
                 step_key, env_state, env_model, action
             )
-            return (key, env_state, env_model, obs), info
+            return (key, env_state, env_model, obs, critic_obs), info
 
         key, init_key = jax.random.split(key)
         init_key = jax.random.split(init_key, env.num_envs)
-        obs, _, env_state, env_model = env.reset(init_key, norm_state)
+        obs, critic_obs, env_state, env_model = env.reset(init_key, norm_state)
         # randomize initial steps
         key, env_key = jax.random.split(key)
         _, infos = jax.lax.scan(
             f=step_env,
-            init=(key, env_state, env_model, obs),
+            init=(key, env_state, env_model, obs, critic_obs),
             xs=None,
             length=max_episode_steps,
         )
@@ -354,7 +435,7 @@ def make_train_fn(
             key, act_key, step_key = jax.random.split(key, 3)
             step_key = jax.random.split(step_key, cfg.num_envs)
 
-            def get_langevin_action(obs, critic_obs, key):
+            def get_langevin_action(obs, critic_obs, precond, key):
                 act_key, key = jax.random.split(key)
 
                 pi: distrax.Distribution = actor_model.actor(obs, scale=offset)
@@ -368,6 +449,14 @@ def make_train_fn(
 
                     return grad 
                 
+                def hessian_precond(action):
+                    hess = jax.hessian(pi.log_prob)(action)
+                    hess = jnp.diagonal(hess, axis1=1, axis2=3)
+                    hess = jnp.diagonal(hess, axis1=0, axis2=3)
+                    hess = jnp.diagonal(hess, axis1=0, axis2=1)  # because hess is diagonal
+
+                    return 1. / jnp.abs(hess)  
+                
                 grad_q = jax.vmap(jax.grad(critic_model.critic, argnums=1))
                     
                 action = policy_action
@@ -379,18 +468,34 @@ def make_train_fn(
                     eps = cfg.lang_a / (cfg.lang_b + it)
                     eta = jax.random.normal(eta_key, policy_action.shape)
 
-                    act_delta = eps * 0.5 * (grad_q(critic_obs, action) \
+                    if precond:
+                        C = hessian_precond(action)
+                    else:
+                        C = jnp.ones_like(action)
+
+                    act_delta = eps * 0.5 * C * (grad_q(critic_obs, action) \
                           + alpha * cfg.lang_prior_scaler * grad_log_pi(action)) \
-                          + alpha * jnp.sqrt(eps) * eta
+                          + alpha * jnp.sqrt(eps * C) * eta
                     
                     action = action + act_delta
                     action = jnp.clip(action, -1. + 1.e-4, 1. - 1.e-4)
 
+            
+                first_q_grad = grad_q(critic_obs, policy_action)
+                first_pi_grad = grad_log_pi(policy_action)
+
                 return action, dict(
                     lang_total_act_delta_norm = jnp.linalg.norm(action - policy_action, axis=-1), 
                     lang_last_act_delta_norm = jnp.linalg.norm(act_delta, axis=-1),
-                    lang_first_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, policy_action), axis=-1),
-                    lang_first_grad_pi_norm = jnp.linalg.norm(grad_log_pi(policy_action), axis=-1),
+
+                    lang_first_grad_q_norm = jnp.linalg.norm(first_q_grad, axis=-1),
+                    lang_first_grad_q_max = first_q_grad.max( axis=-1),
+                    lang_first_grad_pi_norm = jnp.linalg.norm(first_pi_grad, axis=-1),
+                    lang_first_grad_pi_max = first_pi_grad.max(axis=-1),
+
+                    lang_last_precond_norm = jnp.linalg.norm(C, axis=-1),
+                    lang_last_precond_max = C.max(axis=-1),
+                    lang_last_precond_min = C.min(axis=-1),
 
                     lang_last_grad_q_norm = jnp.linalg.norm(grad_q(critic_obs, action), axis=-1),
                     lang_last_grad_pi_norm = jnp.linalg.norm(grad_log_pi(action), axis=-1),
@@ -407,7 +512,7 @@ def make_train_fn(
             pi = actor_model.actor(obs, scale=offset)
 
             if cfg.lang:
-                action, act_info = get_langevin_action(obs, critic_obs, act_key)
+                action, act_info = get_langevin_action(obs, critic_obs, cfg.lang_precond, act_key)
             else:
                 action = pi.sample(seed=act_key)
                 act_info = dict(
@@ -766,7 +871,7 @@ def make_train_fn(
             train_metrics = jax.tree.map(lambda x: x[-1], train_metrics)
             act_infos = jax.tree.map(lambda x: x[-1], act_infos)
 
-            policy = make_policy(train_state)
+            policy = make_policy(train_state, cfg)
             if cfg.normalize_env:
                 norm_state = train_state.last_env_state
             else:
