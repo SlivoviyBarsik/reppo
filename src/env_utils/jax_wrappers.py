@@ -137,8 +137,8 @@ def make_randomization_fn(cfg, mj_model):
     def randomization_fn(mjx_model, rng):
         def make_random_vecs(rng):
             mass_rng, gravity_rng = jax.random.split(rng)
-            body_mass = jnp.log(body_mass_perturbations.sample(seed=mass_rng) + 1)
-            gravity = jnp.log(gravity_perturbations.sample(seed=gravity_rng) + 1)
+            body_mass = jnp.log(jnp.exp(body_mass_perturbations.sample(seed=mass_rng)) + 1)
+            gravity = jnp.log(jnp.exp(gravity_perturbations.sample(seed=gravity_rng)) + 1)
 
             return body_mass, gravity
         
