@@ -25,4 +25,5 @@ python src/jaxrl/reppo.py --config-name=reppo \
     tune=false \
     env.pert.body_mass_pert=$1 \
     env.pert.gravity_pert=$2 \
+    env.pert.eval_gravity_pert=$3 \
     tags=[reppo,pert_robustness]

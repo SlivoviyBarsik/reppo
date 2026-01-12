@@ -11,3 +11,4 @@ vmax: 150
 pert:
   body_mass_pert: 1.0
   gravity_pert: 1.0
+  eval_gravity_pert: 1.5

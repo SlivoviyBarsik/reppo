@@ -29,6 +29,7 @@ class MjxGymnaxWrapper(Environment):
         config: dict = None,
         asymmetric_observation: bool = False,
         randomization_cfg: dict = None,
+        eval: bool = False
     ):
         if isinstance(env_or_name, str):
             if config is None:
@@ -47,7 +48,7 @@ class MjxGymnaxWrapper(Environment):
             if episode_length is not None:
                 env = wrap_for_brax_training(
                     env, episode_length=episode_length, action_repeat=action_repeat,
-                    randomization_fn=make_randomization_fn(randomization_cfg, env.mj_model)
+                    randomization_fn=make_randomization_fn(randomization_cfg, env.mj_model, eval)
                 )
             self.env = env
         else:
@@ -120,25 +121,42 @@ class MjxGymnaxWrapper(Environment):
         )
     
 
-def make_randomization_fn(cfg, mj_model):
+def make_randomization_fn(cfg, mj_model, eval: bool = False):
     if cfg is None:
         return None 
     
-    gravity_perturbations = distrax.Uniform(
-        low = (1.0 / cfg.gravity_pert) * jnp.ones_like(mj_model.opt.gravity), 
-        high = cfg.gravity_pert * jnp.ones_like(mj_model.opt.gravity)
-    )
+    def make_pert(cfg, eval):
+        if eval:
+            n_bins = 64
+            dist = distrax.Categorical(probs = (1.0 / n_bins) * jnp.ones([n_bins,]))
+            
+            g_support = jnp.linspace(1.0 / cfg.eval_gravity_pert, cfg.eval_gravity_pert, n_bins)
+            gravity_perturbations = lambda seed: g_support[dist.sample(seed = seed)] * jnp.ones_like(mj_model.opt.gravity)
 
-    body_mass_perturbations = distrax.Uniform(
-        low = (1.0 / cfg.body_mass_pert) * jnp.ones_like(mj_model.body_mass),
-        high = cfg.body_mass_pert * jnp.ones_like(mj_model.body_mass)
-    ) 
+            b_support = jnp.linspace(1.0 / cfg.body_mass_pert, cfg.body_mass_pert, n_bins)
+            body_mass_perturbations = lambda seed: b_support[dist.sample(seed = seed)]
+        else:
+            g_dist = distrax.Uniform(
+                low = (1.0 / cfg.gravity_pert) * jnp.ones_like(mj_model.opt.gravity), 
+                high = cfg.gravity_pert * jnp.ones_like(mj_model.opt.gravity)
+            )
+            b_dist = distrax.Uniform(
+                low = (1.0 / cfg.body_mass_pert) * jnp.ones_like(mj_model.body_mass),
+                high = cfg.body_mass_pert * jnp.ones_like(mj_model.body_mass)
+            ) 
+            
+            gravity_perturbations = lambda seed: g_dist.sample(seed = seed)
+            body_mass_perturbations = lambda seed: b_dist.sample(seed = seed)
+        
+        return gravity_perturbations, body_mass_perturbations
+
+    gravity_perturbations, body_mass_perturbations = make_pert(cfg, eval)
     
     def randomization_fn(mjx_model, rng):
         def make_random_vecs(rng):
             mass_rng, gravity_rng = jax.random.split(rng)
-            body_mass = body_mass_perturbations.sample(seed=mass_rng)
-            gravity = gravity_perturbations.sample(seed=gravity_rng)
+            body_mass = body_mass_perturbations(mass_rng)
+            gravity = gravity_perturbations(gravity_rng)
 
             return body_mass, gravity
         

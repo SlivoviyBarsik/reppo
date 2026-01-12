@@ -26,4 +26,5 @@ python src/jaxrl/reppo.py --config-name=reppo \
     experiment_overrides=langevin \
     env.pert.body_mass_pert=$1 \
     env.pert.gravity_pert=$2 \
+    env.pert.eval_gravity_pert=$3 \
     tags=[langevin,pert_robustness]

@@ -398,6 +398,7 @@ def make_init(
 def make_train_fn(
     cfg: ReppoConfig,
     env: Environment,
+    eval_env: Environment,
     env_params: EnvParams = None,
     log_callback: Callable[[SACTrainState, dict[str, jax.Array]], None] | None = None,
     num_seeds: int = 1,
@@ -406,10 +407,15 @@ def make_train_fn(
     env_params = env_params  # or env.default_params
     env = LogWrapper(env, cfg.num_envs)
     env = ClipAction(env)
+
+    eval_env = LogWrapper(eval_env, cfg.num_envs)
+    eval_env = ClipAction(eval_env)
     # env = VecEnv(env, cfg.num_envs)
     if cfg.normalize_env:
         env = NormalizeVec(env)
-    eval_fn = make_eval_fn(env, cfg.max_episode_steps, reward_scale=reward_scale)
+        eval_env = NormalizeVec(eval_env)
+
+    eval_fn = make_eval_fn(eval_env, cfg.max_episode_steps, reward_scale=reward_scale)
     action_size_target = (
         jnp.prod(jnp.array(env.action_space(env_params).shape)) * cfg.ent_target_mult
     )
@@ -1069,6 +1075,16 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             asymmetric_observation=cfg.env.get("asymmetric_obs", False),
             randomization_cfg=cfg.env.get("pert", None)
         )
+
+        eval_env = MjxGymnaxWrapper(
+            cfg.env.name,
+            episode_length=cfg.env.max_episode_steps,
+            reward_scale=cfg.env.reward_scaling,
+            push_distractions=cfg.env.get("push_distractions", False),
+            asymmetric_observation=cfg.env.get("asymmetric_obs", False),
+            randomization_cfg=cfg.env.get("pert", None),
+            eval=True
+        )
     else:
         raise ValueError(f"Unknown environment type: {cfg.env.type}")
 
@@ -1077,6 +1093,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
     train_fn = make_train_fn(
         cfg=ReppoConfig(**cfg.hyperparameters),
         env=env,
+        eval_env=eval_env,
         log_callback=log_callback,
         num_seeds=cfg.num_seeds,
         reward_scale=1.0 / cfg.env.reward_scaling,
