@@ -124,21 +124,21 @@ def make_randomization_fn(cfg, mj_model):
     if cfg is None:
         return None 
     
-    gravity_perturbations = distrax.MultivariateNormalDiag(
-        loc = jnp.log(jnp.e - 1) * jnp.ones_like(mj_model.opt.gravity), 
-        scale_diag = (mj_model.opt.gravity != 0) * cfg["gravity_pert"]
+    gravity_perturbations = distrax.Uniform(
+        low = (1.0 / cfg.gravity_pert) * jnp.ones_like(mj_model.opt.gravity), 
+        high = cfg.gravity_pert * jnp.ones_like(mj_model.opt.gravity)
     )
 
-    body_mass_perturbations = distrax.Normal(
-        loc = jnp.log(jnp.e - 1) * jnp.ones_like(mj_model.body_mass),
-        scale = cfg["body_mass_pert"] * jnp.ones_like(mj_model.body_mass)
+    body_mass_perturbations = distrax.Uniform(
+        low = (1.0 / cfg.body_mass_pert) * jnp.ones_like(mj_model.body_mass),
+        high = cfg.body_mass_pert * jnp.ones_like(mj_model.body_mass)
     ) 
     
     def randomization_fn(mjx_model, rng):
         def make_random_vecs(rng):
             mass_rng, gravity_rng = jax.random.split(rng)
-            body_mass = jnp.log(jnp.exp(body_mass_perturbations.sample(seed=mass_rng)) + 1)
-            gravity = jnp.log(jnp.exp(gravity_perturbations.sample(seed=gravity_rng)) + 1)
+            body_mass = body_mass_perturbations.sample(seed=mass_rng)
+            gravity = gravity_perturbations.sample(seed=gravity_rng)
 
             return body_mass, gravity
         

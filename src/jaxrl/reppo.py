@@ -245,6 +245,8 @@ def make_eval_fn(
             length=max_episode_steps,
         )
 
+        res_arr = jnp.concat([env_model.body_mass, env_model.opt.gravity, infos["returned_episode_returns"].sum(0)[:,None]], axis=-1)
+
         return {
             "episode_return": infos["returned_episode_returns"].mean(
                 where=infos["returned_episode"]
@@ -260,6 +262,7 @@ def make_eval_fn(
                 where=infos["returned_episode"]
             ),
             "num_episodes": infos["returned_episode"].sum(),
+            "total_res_table": res_arr,
         }
 
     return evaluation_fn
@@ -1032,6 +1035,21 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             "eval/episode_length": eval_length,
             **jax.tree.map(jnp.mean, utils.filter_prefix("train", metrics)),
         }
+
+        table_columns = [f"b{i}" for i in range(metrics["eval/total_res_table"].shape[-1] - 4)]
+        table_columns.extend([f"g{i}" for i in range(3)])
+        table_columns.append("r")
+
+        table_data = metrics["eval/total_res_table"]
+        table_data = [table_data[0,i,:] for i in range(table_data.shape[1])]
+
+        table = wandb.Table(
+            columns = table_columns,
+            data = table_data
+        )
+
+        log_data.update({f"tot_table_{state.time_steps[0]}": table})
+
         wandb.log(log_data, step=state.time_steps[0])
 
     # Set up the experiment
