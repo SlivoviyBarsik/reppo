@@ -132,21 +132,19 @@ def make_randomization_fn(cfg, mj_model, eval: bool = False):
             
             g_support = jnp.linspace(1.0 / cfg.eval_gravity_pert, cfg.eval_gravity_pert, n_bins)
             gravity_perturbations = lambda seed: g_support[dist.sample(seed = seed)] * jnp.ones_like(mj_model.opt.gravity)
-
-            b_support = jnp.linspace(1.0 / cfg.body_mass_pert, cfg.body_mass_pert, n_bins)
-            body_mass_perturbations = lambda seed: b_support[dist.sample(seed = seed)]
         else:
             g_dist = distrax.Uniform(
                 low = (1.0 / cfg.gravity_pert) * jnp.ones_like(mj_model.opt.gravity), 
                 high = cfg.gravity_pert * jnp.ones_like(mj_model.opt.gravity)
             )
-            b_dist = distrax.Uniform(
-                low = (1.0 / cfg.body_mass_pert) * jnp.ones_like(mj_model.body_mass),
-                high = cfg.body_mass_pert * jnp.ones_like(mj_model.body_mass)
-            ) 
-            
             gravity_perturbations = lambda seed: g_dist.sample(seed = seed)
-            body_mass_perturbations = lambda seed: b_dist.sample(seed = seed)
+        
+        b_dist = distrax.Uniform(
+            low = (1.0 / cfg.body_mass_pert) * jnp.ones_like(mj_model.body_mass),
+            high = cfg.body_mass_pert * jnp.ones_like(mj_model.body_mass)
+        ) 
+        
+        body_mass_perturbations = lambda seed: b_dist.sample(seed = seed)
         
         return gravity_perturbations, body_mass_perturbations
 
